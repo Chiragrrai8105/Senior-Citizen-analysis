@@ -1,333 +1,481 @@
-import cv2
-import time
-import torch
+import streamlit as st
 import pandas as pd
-
+import os
+import cv2
+import av
+import plotly.express as px
+import pandas as pd
+import time
+import threading
+from streamlit_webrtc import webrtc_streamer, VideoProcessorBase
 from detector import SeniorCitizenDetector
 from utils import CSVLogger
+import torch
+import platform
+import psutil
+from datetime import datetime
 
+st.sidebar.markdown("---")
 
-# ----------------------------------------------------
-# Initialize Detector
-# ----------------------------------------------------
+st.sidebar.write("Current Time")
 
-detector = SeniorCitizenDetector()
+st.sidebar.success(
+    datetime.now().strftime("%d-%m-%Y %H:%M:%S")
+)
+
+@st.cache_resource
+def load_detector():
+    return SeniorCitizenDetector()
+
+detector = load_detector()
 
 logger = CSVLogger("visits.csv")
 
+class VideoProcessor(VideoProcessorBase):
 
-# ----------------------------------------------------
-# GPU Information
-# ----------------------------------------------------
+    def __init__(self):
 
-if torch.cuda.is_available():
+        self.detector = detector
 
-    gpu_name = torch.cuda.get_device_name(0)
+        self.logger = logger
 
-else:
+        self.total = 0
+        self.senior = 0
+        self.male = 0
+        self.female = 0
 
-    gpu_name = "CPU"
+        self.fps = 0
+        self.prev_time = time.time()
+        self.latest_frame = None
 
+    def recv(self, frame):
 
-print("="*60)
-print("Senior Citizen Identification System")
-print("="*60)
-print("Device :", gpu_name)
-print("="*60)
+        img = frame.to_ndarray(format="bgr24")
 
+        img, detections = self.detector.detect(img)
+        self.latest_frame = img.copy()
 
-# ----------------------------------------------------
-# Camera
-# ----------------------------------------------------
+        self.total = len(detections)
+        self.senior = 0
+        self.male = 0
+        self.female = 0
 
-cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+        for det in detections:
 
-cap.set(cv2.CAP_PROP_FRAME_WIDTH,640)
-cap.set(cv2.CAP_PROP_FRAME_HEIGHT,480)
-cap.set(cv2.CAP_PROP_FPS,30)
+            if det["gender"] == "Male":
+                self.male += 1
+            else:
+                self.female += 1
 
+            if det["status"] == "Senior Citizen":
 
-if not cap.isOpened():
+                self.senior += 1
 
-    print("Cannot Open Camera")
+                self.logger.log(
+                    det["age"],
+                    det["gender"],
+                    det["status"]
+                )
 
-    exit()
+        current = time.time()
 
+        self.fps = int(1 / (current - self.prev_time))
 
-# ----------------------------------------------------
-# Variables
-# ----------------------------------------------------
+        self.prev_time = current
 
-previous_time = time.time()
+        return av.VideoFrame.from_ndarray(
+            img,
+            format="bgr24"
+        )
+# ---------------------------------------------------
+# Streamlit Page Configuration
+# ---------------------------------------------------
 
-fps = 0
+st.set_page_config(
+    page_title="Senior Citizen Identification System",
+    page_icon="👴",
+    layout="wide"
+)
+st.markdown("""
+<style>
 
-total_persons = 0
+.main {
+    background-color:#f5f7fa;
+}
 
-senior_count = 0
+section[data-testid="stSidebar"]{
+    background:#1e293b;
+}
 
-male_count = 0
+section[data-testid="stSidebar"] *{
+    color:white;
+}
 
-female_count = 0
+div[data-testid="metric-container"]{
+    border-radius:15px;
+    padding:18px;
+    background:#ffffff;
+    box-shadow:0 2px 10px rgba(0,0,0,.12);
+}
 
-font = cv2.FONT_HERSHEY_SIMPLEX
+.stButton>button{
+    width:100%;
+    height:55px;
+    border-radius:12px;
+    font-size:18px;
+    font-weight:bold;
+}
 
-print("\nPress Q to Exit\n")
+h1,h2,h3{
+    color:#1e293b;
+}
 
+</style>
+""", unsafe_allow_html=True)
+# ---------------------------------------------------
+# Sidebar
+# ---------------------------------------------------
 
-# ----------------------------------------------------
-# Main Loop
-# ----------------------------------------------------
+st.sidebar.title("📌 Navigation")
 
-while True:
+page = st.sidebar.radio(
+    "Go To",
+    [
+        "🏠 Home",
+        "📷 Live Detection",
+        "📊 Detection History",
+        "📈 Analytics",
+        "⚙ Settings",
+        "ℹ About"
+    ]
+)
 
-    ret, frame = cap.read()
+# ---------------------------------------------------
+# HOME
+# ---------------------------------------------------
 
-    if not ret:
+if page == "🏠 Home":
 
-        break
+    st.title("👴 Senior Citizen Identification System")
 
-    frame = cv2.flip(frame,1)
+    st.markdown("---")
 
-    frame, detections = detector.detect(frame)
+    st.subheader("Project Overview")
 
-    total_persons = len(detections)
+    st.write("""
+This AI-powered system detects people from a live camera feed,
+predicts their age and gender, identifies senior citizens
+(age ≥ 60), and stores the visit details automatically.
 
-    senior_count = 0
+### Features
 
-    male_count = 0
+- ✅ Face Detection (YOLO)
+- ✅ Age Prediction
+- ✅ Gender Prediction
+- ✅ Senior Citizen Detection
+- ✅ Automatic CSV Logging
+- ✅ Analytics Dashboard
+    """)
 
-    female_count = 0
-    # -----------------------------------------
-    # Statistics
-    # -----------------------------------------
+    st.info("Click **Live Detection** from the sidebar to start the camera.")
 
-    for det in detections:
+    col1, col2, col3 = st.columns(3)
 
-        if det["gender"] == "Male":
+    with col1:
+        st.metric("Model", "YOLO + EfficientNet")
 
-            male_count += 1
+    with col2:
+        st.metric("Age Limit", "60+")
+
+    with col3:
+        st.metric("Status", "Ready")
+
+# ---------------------------------------------------
+# LIVE DETECTION
+# ---------------------------------------------------
+
+elif page == "📷 Live Detection":
+
+    st.title("📷 Live Detection")
+
+    st.markdown("---")
+
+    col1, col2 = st.columns([3,1])
+
+    with col1:
+
+        ctx = webrtc_streamer(
+
+            key="senior-camera",
+
+            video_processor_factory=VideoProcessor,
+
+            media_stream_constraints={
+
+                "video": True,
+
+                "audio": False
+
+            },
+
+            async_processing=True
+        )
+
+    with col2:
+
+        st.subheader("Live Statistics")
+
+        if ctx.video_processor:
+
+            vp = ctx.video_processor
+
+            st.metric("Persons", vp.total)
+
+            st.metric("Senior", vp.senior)
+
+            st.metric("Male", vp.male)
+
+            st.metric("Female", vp.female)
+
+            st.metric("FPS", vp.fps)
 
         else:
 
-            female_count += 1
+            st.info("Start the camera.")
 
-        if det["status"] == "Senior Citizen":
+    if st.button("📸 Capture Frame"):
 
-            senior_count += 1
+        if ctx.video_processor and ctx.video_processor.latest_frame is not None:
 
-            logger.log(
+            os.makedirs("screenshots", exist_ok=True)
 
-                det["age"],
+            cv2.imwrite(
 
-                det["gender"],
+                f"screenshots/frame_{time.time()}.jpg",
 
-                det["status"]
+                ctx.video_processor.latest_frame
 
             )
 
+            st.success("Screenshot Saved")
 
-    # -----------------------------------------
-    # FPS
-    # -----------------------------------------
+        else:
 
-    current = time.time()
+            st.warning("Start the camera before capturing a frame.")            
 
-    fps = 1 / (current - previous_time)
+# ---------------------------------------------------
+# HISTORY
+# ---------------------------------------------------
 
-    previous_time = current
+elif page == "📊 Detection History":
 
+    st.title("📊 Detection History")
 
-    # -----------------------------------------
-    # Header
-    # -----------------------------------------
+    csv_file = "visits.csv"
 
-    cv2.rectangle(
+    if os.path.exists(csv_file):
 
-        frame,
+        df = pd.read_csv(csv_file)
 
-        (0,0),
+        if df.empty:
+            st.info("No detections available yet.")
+        else:
 
-        (640,90),
+            st.subheader("Search Records")
 
-        (40,40,40),
+            search = st.text_input("Search")
 
-        -1
+            gender = st.selectbox(
+                "Gender",
+                ["All", "Male", "Female"]
+            )
 
-    )
-    cv2.putText(
+            status = st.selectbox(
+                "Status",
+                ["All", "Senior Citizen"]
+            )
 
-        frame,
+            filtered = df.copy()
 
-        "Senior Citizen Identification",
+            if search:
+                filtered = filtered[
+                    filtered.astype(str)
+                    .apply(lambda x: x.str.contains(search, case=False))
+                    .any(axis=1)
+                ]
 
-        (10,25),
+            if gender != "All":
+                filtered = filtered[
+                    filtered["Gender"] == gender
+                ]
 
-        font,
+            if status != "All":
+                filtered = filtered[
+                    filtered["Status"] == status
+                ]
 
-        0.7,
+            st.dataframe(
+                filtered,
+                use_container_width=True
+            )
 
-        (255,255,255),
+            st.download_button(
+                "⬇ Download CSV",
+                filtered.to_csv(index=False),
+                "visits.csv",
+                "text/csv"
+            )
 
-        2
+    else:
 
-    )
+        st.warning("No CSV file found.")
 
+# ---------------------------------------------------
+# ANALYTICS
+# ---------------------------------------------------
 
-    cv2.putText(
+elif page == "📈 Analytics":
 
-        frame,
+    st.title("📈 Analytics Dashboard")
 
-        f"Device : {gpu_name}",
+    csv_file = "visits.csv"
 
-        (10,50),
+    if os.path.exists(csv_file):
 
-        font,
+        df = pd.read_csv(csv_file)
 
-        0.55,
+        if df.empty:
 
-        (0,255,255),
+            st.info("No data available.")
 
-        2
+        else:
 
-    )
+            total = len(df)
 
+            male = len(df[df["Gender"]=="Male"])
 
-    cv2.putText(
+            female = len(df[df["Gender"]=="Female"])
 
-        frame,
+            senior = len(df)
 
-        f"FPS : {int(fps)}",
+            c1,c2,c3,c4 = st.columns(4)
 
-        (500,25),
+            c1.metric("Total Visits", total)
 
-        font,
+            c2.metric("Senior Citizens", senior)
 
-        0.7,
+            c3.metric("Male", male)
 
-        (0,255,0),
+            c4.metric("Female", female)
 
-        2
+            st.divider()
 
-    )
-    # -----------------------------------------
-    # Statistics Panel
-    # -----------------------------------------
+            st.subheader("Gender Distribution")
 
-    cv2.rectangle(
+            fig = px.pie(
+                df,
+                names="Gender",
+                hole=0.45
+            )
 
-        frame,
+            st.plotly_chart(
+                fig,
+                use_container_width=True
+            )
 
-        (0,390),
+            st.subheader("Age Distribution")
 
-        (640,480),
+            fig2 = px.histogram(
+                df,
+                x="Age",
+                nbins=20
+            )
 
-        (40,40,40),
+            st.plotly_chart(
+                fig2,
+                use_container_width=True
+            )
 
-        -1
+            st.subheader("Status Distribution")
 
-    )
+            fig3 = px.bar(
+                df["Status"]
+                .value_counts()
+                .reset_index(),
+                x="Status",
+                y="count"
+            )
 
+            st.plotly_chart(
+                fig3,
+                use_container_width=True
+            )
 
-    cv2.putText(
+            st.subheader("Recent Detections")
 
-        frame,
+            st.dataframe(
+                df.tail(10),
+                use_container_width=True
+            )
 
-        f"Persons : {total_persons}",
+    else:
 
-        (10,420),
+        st.warning("No CSV available.")
 
-        font,
+# ---------------------------------------------------
+# SETTINGS
+# ---------------------------------------------------
 
-        0.65,
+elif page == "⚙ Settings":
 
-        (255,255,255),
+    st.title("⚙ Settings")
 
-        2
+    st.markdown("---")
 
-    )
-
-
-    cv2.putText(
-
-        frame,
-
-        f"Senior : {senior_count}",
-
-        (180,420),
-
-        font,
-
-        0.65,
-
-        (0,0,255),
-
-        2
-
-    )
-
-
-    cv2.putText(
-
-        frame,
-
-        f"Male : {male_count}",
-
-        (340,420),
-
-        font,
-
-        0.65,
-
-        (255,0,0),
-
-        2
-
-    )
-
-
-    cv2.putText(
-
-        frame,
-
-        f"Female : {female_count}",
-
-        (470,420),
-
-        font,
-
-        0.65,
-
-        (255,0,255),
-
-        2
-
-    )
-    cv2.imshow(
-
-        "Senior Citizen Identification System",
-
-        frame
-
+    confidence = st.slider(
+        "Confidence Threshold",
+        0.10,
+        1.00,
+        0.45
     )
 
+    resolution = st.selectbox(
+        "Camera Resolution",
+        [
+            "640x480",
+            "1280x720"
+        ]
+    )
 
-    key = cv2.waitKey(1) & 0xFF
+    save_images = st.checkbox(
+        "Save Detected Faces",
+        value=False
+    )
 
-    if key == ord('q'):
+# ---------------------------------------------------
+# ABOUT
+# ---------------------------------------------------
 
-        break
+elif page == "ℹ About":
 
+    st.title("ℹ About")
 
-# ----------------------------------------------------
-# Cleanup
-# ----------------------------------------------------
+    st.markdown("---")
 
-cap.release()
+    st.write("""
+## Senior Citizen Identification System
 
-cv2.destroyAllWindows()
+Version **1.0**
 
+### Technologies Used
 
-print("\nApplication Closed")
+- Streamlit
+- YOLO Face Detection
+- EfficientNet-B0
+- PyTorch
+- OpenCV
+- Pandas
 
-print("CSV Saved Successfully")                
+Developed for AI-based real-time senior citizen identification.
+""")
+    
